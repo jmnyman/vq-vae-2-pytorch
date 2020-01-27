@@ -21,7 +21,8 @@ sys.path.append('/home/nyman/histopath-analysis')
 from generic_vae import pca_simple_vis
 
 
-def train(epoch, loader, model, optimizer, scheduler, device):
+# TODO add dev_loader param and chunk to loop code 
+def train(epoch, loader, dev_loader, model, optimizer, scheduler, device):
     loader = tqdm(loader)
 
     criterion = nn.MSELoss()
@@ -44,6 +45,7 @@ def train(epoch, loader, model, optimizer, scheduler, device):
         #out, latent_loss = model(img)
         recon_loss = criterion(out, img)
         latent_loss = latent_loss.mean()
+        # TODO possibly also add a classifier term here (would require adding module to model itself as well)
         loss = recon_loss + latent_loss_weight * latent_loss
         loss.backward()
 
@@ -94,6 +96,9 @@ def train(epoch, loader, model, optimizer, scheduler, device):
             fig.savefig(f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png')
             plt.close()
 
+            # TODO dev_loader eval code 
+            
+
             model.train()
 
 
@@ -127,7 +132,14 @@ if __name__ == '__main__':
     paths_df = paths_df.loc[partial_indicator['is_512'].values]
     # subset and only take a few slides
     subset_ids = pd.Series(paths_df.index.unique()).sample(20)
+    
+    # grab a set of slides to evaluate during training 
+    dev_subset = paths_df.drop(subset_ids.values)
+    dev_subset_ids = pd.Series(dev_subset.index.unique()).sample(20)
+    
     subset_ids.to_csv('./20200127_train_slide_ids.csv')
+    dev_subset_ids.to_csv('./20200127_dev_slide_ids.csv')
+
     paths_df = paths_df.loc[subset_ids]
     print('Subset DF size: ', paths_df.shape)
 
