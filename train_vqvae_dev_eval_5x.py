@@ -14,6 +14,7 @@ from scheduler import CycleScheduler
 # my additions
 import sys
 import os
+from glob import glob
 sys.path.append('/home/nyman/')
 from tmb_bot import utilities
 import pandas as pd
@@ -215,13 +216,17 @@ if __name__ == '__main__':
     # TODO update if we do augmentation on train set...
     eval_transform = transform
 
-    # manual hardcoding
-    paths_df = pd.read_pickle('/home/nyman/20191025_dfci_full_rcc_paths_df_annotated_reexport.pkl') # tried exporting above in `rapids` conda env
-    partial_indicator = pd.read_csv('/home/nyman/20191025_dfci_full_rcc_paths_df_annotated_jupyterexport_PARTIAL_TILE_INDICATOR.csv')
-    # subset out tiles that aren't 512x512 
-    paths_df = paths_df.loc[partial_indicator['is_512'].values]
-    NUM_TRAIN_SLIDES = 10
-    NUM_DEV_SLIDES = 10
+    # 5x tiles 
+    root_dir = '/mnt/disks/image_data2/5x/'
+    paths = glob(os.path.join(root_dir, '*/*/*.jpeg'))
+    ids = [x.split('/')[-3].split('_files')[0] for x in paths]
+    paths_df = pd.DataFrame()
+    paths_df['slide_id'] = ids
+    paths_df['full_path'] = paths
+    paths_df = paths_df.set_index('slide_id')
+
+    NUM_TRAIN_SLIDES = 200
+    NUM_DEV_SLIDES = 40
     #NUM_TRAIN_SLIDES = 100
     #NUM_DEV_SLIDES = 20
     # subset and only take a few slides
@@ -244,12 +249,10 @@ if __name__ == '__main__':
     dataset = utilities.Dataset(paths_df.full_path.values, paths_df.index.values, transform)
     # TODO give different transform to train and dev/eval datasets
     dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.index.values, transform)
-    #BATCH_SIZE=140
-    BATCH_SIZE=40
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    dev_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    #loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16)
-    #dev_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16)
+    BATCH_SIZE=140
+    #BATCH_SIZE=50
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16)
+    dev_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16)
 
     N_EMBED = 10
     print('Using K={} codebook size'.format(N_EMBED))

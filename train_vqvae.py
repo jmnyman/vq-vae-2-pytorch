@@ -135,7 +135,7 @@ if __name__ == '__main__':
 
     #dataset = datasets.ImageFolder(args.path, transform=transform)
     #loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4)
-    loader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=12)
+    loader = DataLoader(dataset, batch_size=70, shuffle=True, num_workers=12)
 
     N_EMBED = 512
     print('Using K={} codebook size'.format(N_EMBED))
