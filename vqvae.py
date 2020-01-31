@@ -89,7 +89,7 @@ class ResBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channel, channel, n_res_block, n_res_channel, stride):
+    def __init__(self, in_channel, channel, n_res_block, n_res_channel, stride, n_additional_downsample_layers):
         super().__init__()
 
         if stride == 4:
@@ -108,6 +108,10 @@ class Encoder(nn.Module):
                 nn.Conv2d(channel // 2, channel, 3, padding=1),
             ]
 
+        # ADDITIONAL DOWNSAMPLING
+        for i in range(n_additional_downsample_layers):
+            blocks.append(nn.Conv2d(channel, channel, kernel_size=4, stride=2, padding=1))
+
         for i in range(n_res_block):
             blocks.append(ResBlock(channel, n_res_channel))
 
@@ -121,8 +125,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(
-        self, in_channel, out_channel, channel, n_res_block, n_res_channel, stride
-    ):
+            self, in_channel, out_channel, channel, n_res_block, n_res_channel, stride, n_additional_upsample_layers):
         super().__init__()
 
         blocks = [nn.Conv2d(in_channel, channel, 3, padding=1)]
@@ -131,6 +134,10 @@ class Decoder(nn.Module):
             blocks.append(ResBlock(channel, n_res_channel))
 
         blocks.append(nn.ReLU(inplace=True))
+
+        # additional upsampling to match additional downsampling
+        for i in range(n_additional_upsample_layers):
+            blocks.append(nn.ConvTranspose2d(channel, channel, kernel_size=4, stride=2, padding=1))
 
         if stride == 4:
             blocks.extend(
@@ -164,15 +171,17 @@ class VQVAE(nn.Module):
         embed_dim=64,
         n_embed=512,
         decay=0.99,
+        n_additional_downsample_layers=3,
+        n_additional_upsample_layers=3,
     ):
         super().__init__()
 
-        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
-        self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
+        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, 4, n_additional_downsample_layers)
+        self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, 2, 0)
         self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
         self.quantize_t = Quantize(embed_dim, n_embed)
         self.dec_t = Decoder(
-            embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2
+            embed_dim, embed_dim, channel, n_res_block, n_res_channel, 2, n_additional_upsample_layers=0
         )
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
         self.quantize_b = Quantize(embed_dim, n_embed)
@@ -185,7 +194,8 @@ class VQVAE(nn.Module):
             channel,
             n_res_block,
             n_res_channel,
-            stride=4,
+            4,
+            n_additional_upsample_layers
         )
 
     def forward(self, input):
