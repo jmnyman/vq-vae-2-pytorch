@@ -178,6 +178,7 @@ class VQVAE(nn.Module):
     ):
         super().__init__()
         self.input_size = input_size
+        self.embed_dim = embed_dim
 
         self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, 4, n_additional_downsample_layers)
         self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, 2, 0)
@@ -201,8 +202,10 @@ class VQVAE(nn.Module):
             n_additional_upsample_layers
         )
 
-        self.downsample_top_size = self.input_size / 2**(2+n_additional_downsample_layers)
-        self.unrolled_top_size = n_embed*self.downsample_top_size**2
+        self.dropout = nn.Dropout()
+
+        self.downsample_top_size = self.input_size / 2**(3+n_additional_downsample_layers)
+        self.unrolled_top_size = int(self.embed_dim * self.downsample_top_size**2)
 
         # CLASSIFIER [disabled by default with a scale of 0]
         self.num_classes = num_classes
@@ -216,23 +219,25 @@ class VQVAE(nn.Module):
         return dec, diff, enc_t, enc_b, classifier_loss
 
     def encode(self, input, labels):
+        batch_size = input.shape[0]
+
         enc_b = self.enc_b(input)
         enc_t = self.enc_t(enc_b)
 
+        pre_quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1) # pre-actual quantization
         # New: run classifier on pre-quantized top level encoding
-        classifier_logits = self.classifier_fc(enc_t.view(enc_t.shape[0],-1))
-        classifier_loss = self.cross_ent(classifier_logits, labels)
-
-        quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
-        quant_t, diff_t, id_t = self.quantize_t(quant_t)
+        classifier_logits = self.classifier_fc(self.dropout(pre_quant_t.contiguous().view(batch_size,-1)))
+        classifier_loss = self.cross_ent(classifier_logits, labels.long()).unsqueeze(0)
+        
+        quant_t, diff_t, id_t = self.quantize_t(pre_quant_t)
         quant_t = quant_t.permute(0, 3, 1, 2)
         diff_t = diff_t.unsqueeze(0)
 
         dec_t = self.dec_t(quant_t)
         enc_b = torch.cat([dec_t, enc_b], 1)
 
-        quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
-        quant_b, diff_b, id_b = self.quantize_b(quant_b)
+        pre_quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
+        quant_b, diff_b, id_b = self.quantize_b(pre_quant_b) # I renamed to avoid confusion; not sure performance hit
         quant_b = quant_b.permute(0, 3, 1, 2)
         diff_b = diff_b.unsqueeze(0)
 

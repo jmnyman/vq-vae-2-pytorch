@@ -66,7 +66,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
     criterion = nn.MSELoss()
 
     latent_loss_weight = 0.25
-    classifier_loss_weight = 0.25 # no idea what to put as for now
+    classifier_loss_weight = 0.01 # no idea what to put as for now
     sample_size = 25
 
     mse_sum = 0
@@ -77,10 +77,12 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
 
         img = img.to(device)
 
-        out, latent_loss, enc_t, enc_b, classifier_loss = model(img)
+        out, latent_loss, enc_t, enc_b, classifier_loss = model(img, label)
         
         recon_loss = criterion(out, img)
         latent_loss = latent_loss.mean()
+        classifier_loss = classifier_loss.mean() # multi GPU 
+
         # TODO possibly also add a classifier term here (would require adding module to model itself as well)
         loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
         loss.backward()
@@ -98,7 +100,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
             (
                 f'train; '
                 f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
-                f'classifier: {classifier_loss.item():.3f}; '
+                f'classifier: {classifier_loss_weight * classifier_loss.item():.3f}; '
                 f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 f'lr: {lr:.5f}'
             )
@@ -166,9 +168,10 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
             model.zero_grad()
             img = img.to(device)
 
-            out, latent_loss, enc_t, enc_b = model(img)
+            out, latent_loss, enc_t, enc_b, classifier_loss = model(img, label)
             recon_loss = criterion(out, img)
             latent_loss = latent_loss.mean()
+            classifier_loss = classifier_loss.mean()
             # TODO possibly also add a classifier term here (would require adding module to model itself as well)
             loss = recon_loss + latent_loss_weight * latent_loss
 
@@ -182,6 +185,7 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
                 (
                     f'eval; '
                     f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
+                    f'classifier: {classifier_loss.item():.3f}; '
                     f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 )
             )
@@ -317,26 +321,35 @@ if __name__ == '__main__':
 
     # subset by clearcell vs nonclearcell and sample evenly
     print('evenly splitting b/t kirc/nonkirc slides')
-    paths_df = paths_df.groupby('is_kirc').apply(lambda x: x.sample(int(2*args.train_slides)))
+    paths_df.index.name = 'idx'
+    data_anno = paths_df.reset_index().drop_duplicates('idx')
+    all_ids_subset = data_anno.groupby('is_kirc').apply(lambda x: x.sample(int(2*args.train_slides))).reset_index(0, drop=True)
+    all_ids_subset = all_ids_subset['idx'].values
+    print(all_ids_subset.shape)
+    
     # subset and only take a few slides
-    subset_ids = pd.Series(paths_df.index.unique()).sample(args.train_slides)
-    
-    # grab a set of slides to evaluate during training 
-    dev_subset = paths_df.drop(subset_ids.values)
-    dev_subset_ids = pd.Series(dev_subset.index.unique()).sample(args.dev_slides)
-    
-    subset_ids.to_csv(os.path.join(expt_dir, 'train_slide_ids.csv'))
-    dev_subset_ids.to_csv(os.path.join(expt_dir, 'dev_slide_ids.csv'))
-    dev_paths_df = paths_df.loc[dev_subset_ids]
+    train_ids = pd.Series(all_ids_subset).sample(args.train_slides)
+    train_paths_df = paths_df.loc[train_ids]
 
-    paths_df = paths_df.loc[subset_ids]
-    print('Train Subset DF size: ', paths_df.shape)
+    # grab a set of slides to evaluate during training 
+    #dev_subset = paths_df.drop(subset_ids.values)
+    dev_subset = [x for x in all_ids_subset if x not in train_ids.values]
+    dev_subset_ids = pd.Series(dev_subset).sample(args.dev_slides)
+    dev_paths_df = paths_df.loc[dev_subset_ids]
+    
+    train_ids.to_csv(os.path.join(expt_dir, 'train_slide_ids.csv'))
+    dev_subset_ids.to_csv(os.path.join(expt_dir, 'dev_slide_ids.csv'))
+
+    print('Train Subset DF size: ', train_paths_df.shape)
     print('Dev Subset DF size: ', dev_paths_df.shape)
+
+    print('train balance: ', train_paths_df.is_kirc.mean())
+    print('dev balance: ', dev_paths_df.is_kirc.mean())
 
     # TODO add subsampling via controlling # tiles per slide sampled....
 
-    dataset = utilities.Dataset(paths_df.full_path.values, paths_df.is_kirc.values, train_transform)
-    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.is_kirc.values, eval_transform)
+    dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df.is_kirc.values.astype(int), train_transform)
+    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.is_kirc.values.astype(int), eval_transform)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
 
