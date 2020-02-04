@@ -173,8 +173,11 @@ class VQVAE(nn.Module):
         decay=0.99,
         n_additional_downsample_layers=3,
         n_additional_upsample_layers=3,
+        num_classes=2,
+        input_size=512,
     ):
         super().__init__()
+        self.input_size = input_size
 
         self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, 4, n_additional_downsample_layers)
         self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, 2, 0)
@@ -198,16 +201,27 @@ class VQVAE(nn.Module):
             n_additional_upsample_layers
         )
 
-    def forward(self, input):
-        quant_t, quant_b, diff, _, _, enc_t, enc_b = self.encode(input)
-        #quant_t, quant_b, diff, _, _ = self.encode(input)
+        self.downsample_top_size = self.input_size / 2**(2+n_additional_downsample_layers)
+        self.unrolled_top_size = n_embed*self.downsample_top_size**2
+
+        # CLASSIFIER [disabled by default with a scale of 0]
+        self.num_classes = num_classes
+        self.classifier_fc = nn.Linear(self.unrolled_top_size, self.num_classes)
+        self.cross_ent = nn.CrossEntropyLoss(reduction='sum')
+
+    def forward(self, input, labels):
+        quant_t, quant_b, diff, _, _, enc_t, enc_b, classifier_loss = self.encode(input, labels)
         dec = self.decode(quant_t, quant_b)
 
-        return dec, diff, enc_t, enc_b
+        return dec, diff, enc_t, enc_b, classifier_loss
 
-    def encode(self, input):
+    def encode(self, input, labels):
         enc_b = self.enc_b(input)
         enc_t = self.enc_t(enc_b)
+
+        # New: run classifier on pre-quantized top level encoding
+        classifier_logits = self.classifier_fc(enc_t.view(enc_t.shape[0],-1))
+        classifier_loss = self.cross_ent(classifier_logits, labels)
 
         quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
         quant_t, diff_t, id_t = self.quantize_t(quant_t)
@@ -222,8 +236,7 @@ class VQVAE(nn.Module):
         quant_b = quant_b.permute(0, 3, 1, 2)
         diff_b = diff_b.unsqueeze(0)
 
-        return quant_t, quant_b, diff_t + diff_b, id_t, id_b, enc_t, enc_b 
-        #return quant_t, quant_b, diff_t + diff_b, id_t, id_b
+        return quant_t, quant_b, diff_t + diff_b, id_t, id_b, enc_t, enc_b, classifier_loss
 
     def decode(self, quant_t, quant_b):
         upsample_t = self.upsample_t(quant_t)

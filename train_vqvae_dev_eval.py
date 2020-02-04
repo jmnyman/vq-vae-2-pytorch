@@ -66,6 +66,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
     criterion = nn.MSELoss()
 
     latent_loss_weight = 0.25
+    classifier_loss_weight = 0.25 # no idea what to put as for now
     sample_size = 25
 
     mse_sum = 0
@@ -76,15 +77,12 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
 
         img = img.to(device)
 
-        out, latent_loss, enc_t, enc_b = model(img)
-        #print('enc_t ', enc_t.shape)
-        #print('enc_b ', enc_b.shape)
+        out, latent_loss, enc_t, enc_b, classifier_loss = model(img)
         
-        #out, latent_loss = model(img)
         recon_loss = criterion(out, img)
         latent_loss = latent_loss.mean()
         # TODO possibly also add a classifier term here (would require adding module to model itself as well)
-        loss = recon_loss + latent_loss_weight * latent_loss
+        loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
         loss.backward()
 
         if scheduler is not None:
@@ -100,6 +98,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
             (
                 f'train; '
                 f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
+                f'classifier: {classifier_loss.item():.3f}; '
                 f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 f'lr: {lr:.5f}'
             )
@@ -316,6 +315,9 @@ if __name__ == '__main__':
     # subset out tiles that aren't 512x512 
     paths_df = paths_df.loc[partial_indicator['is_512'].values]
 
+    # subset by clearcell vs nonclearcell and sample evenly
+    print('evenly splitting b/t kirc/nonkirc slides')
+    paths_df = paths_df.groupby('is_kirc').apply(lambda x: x.sample(int(2*args.train_slides)))
     # subset and only take a few slides
     subset_ids = pd.Series(paths_df.index.unique()).sample(args.train_slides)
     
@@ -333,8 +335,8 @@ if __name__ == '__main__':
 
     # TODO add subsampling via controlling # tiles per slide sampled....
 
-    dataset = utilities.Dataset(paths_df.full_path.values, paths_df.index.values, train_transform)
-    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.index.values, eval_transform)
+    dataset = utilities.Dataset(paths_df.full_path.values, paths_df.is_kirc.values, train_transform)
+    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.is_kirc.values, eval_transform)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
 
