@@ -23,6 +23,7 @@ sys.path.append('/home/nyman/histopath-analysis')
 import datetime
 from sklearn.decomposition import PCA
 import seaborn as sns
+import numpy as np 
 
 def get_timestamp():
     timestamp = '_'.join(str(datetime.datetime.utcnow()).replace(
@@ -60,13 +61,13 @@ def umap_simple_vis(umap_scores, label_store, alpha=0.3, legend=True, **kwargs):
     
     return g
 
-def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
+def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,latent_loss_weight=0.25, classifier_loss_weight=0.001):
     loader = tqdm(loader)
 
     criterion = nn.MSELoss()
 
-    latent_loss_weight = 0.25
-    classifier_loss_weight = 0.01 # no idea what to put as for now
+    #latent_loss_weight = 0.25
+    #classifier_loss_weight = 0.001 # no idea what to put as for now
     sample_size = 25
 
     mse_sum = 0
@@ -105,6 +106,8 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
                 f'lr: {lr:.5f}'
             )
         )
+        
+        training_log.loc[(epoch,i),'train_loss'] = loss.item()
 
         if i % 100 == 0:
             model.eval()
@@ -140,11 +143,10 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir):
 
     # TODO dev_loader eval code [at end of each epoch] 
     # TODO perhaps just make this a separate function to call...
-    train_mse_mean_epoch = mse_sum / mse_n
-    training_log.loc[(epoch, i),'train_loss'] = train_mse_mean_epoch
+    #train_mse_mean_epoch = mse_sum / mse_n
+    #training_log.loc[(epoch, i),'train_loss'] = train_mse_mean_epoch
 
-
-def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
+def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_weight=0.25, classifier_loss_weight=0.001):
     """
     Just taking above train function and removing any gradient updates etc
     """
@@ -154,7 +156,7 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
 
     criterion = nn.MSELoss()
 
-    latent_loss_weight = 0.25
+    #latent_loss_weight = 0.25
     sample_size = 25
 
     mse_sum = 0
@@ -162,6 +164,7 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
     
     enc_t_track = []
     enc_b_track = []
+    label_track = []
 
     with torch.no_grad():
         for i, (img, label) in enumerate(loader):
@@ -173,19 +176,20 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
             latent_loss = latent_loss.mean()
             classifier_loss = classifier_loss.mean()
             # TODO possibly also add a classifier term here (would require adding module to model itself as well)
-            loss = recon_loss + latent_loss_weight * latent_loss
+            loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
 
             mse_sum += recon_loss.item() * img.shape[0]
             mse_n += img.shape[0]
 
-            #enc_t_track.append(enc_t.detach().cpu())
-            #enc_b_track.append(enc_b.detach().cpu())
+            enc_t_track.append(enc_t.detach().cpu())
+            enc_b_track.append(enc_b.detach().cpu())
+            label_track.append(label)
 
             loader.set_description(
                 (
                     f'eval; '
                     f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
-                    f'classifier: {classifier_loss.item():.3f}; '
+                    f'classifier: {classifier_loss_weight * classifier_loss.item():.3f}; '
                     f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 )
             )
@@ -219,10 +223,23 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir):
                 fig = pca_simple_vis(temp_enc_b_agg.view(enc_b.shape[0], -1), label)
                 fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
                 plt.close()
+    # aggregate PCA 
+    temp_enc_t_agg = torch.cat(enc_t_track).detach().cpu()
+    temp_enc_b_agg = torch.cat(enc_b_track).detach().cpu()
+    label_agg = np.concatenate(label_track)
+
+    fig = pca_simple_vis(temp_enc_t_agg.view(temp_enc_t_agg.shape[0], -1), label_agg) # unrolled entirely
+    # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
+    # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
+    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_top_vis.png'))
+    plt.close()
+    fig = pca_simple_vis(temp_enc_b_agg.view(temp_enc_b_agg.shape[0], -1), label_agg)
+    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_bot_vis.png'))
+    plt.close()
 
     model.train()
     eval_mse_mean_epoch = mse_sum / mse_n
-    training_log.loc[(epoch, i),'eval_loss'] = eval_mse_mean_epoch
+    training_log.loc[epoch,'eval_loss'] = eval_mse_mean_epoch
 
 
 
@@ -243,6 +260,8 @@ if __name__ == '__main__':
     parser.add_argument('--embed_dim', help='vqvae2 `embed_dim` param; dimension/channels in pre-quantized latent field', type=int, default=64) # 'embed_dim'
     parser.add_argument('--channel', help='vqvae2 `channel` param; number of channels in the hidden \
             representation (prior to latent field representation/quantization)', type=int, default=128) # 'channel'
+    parser.add_argument('-clw','--classifier_loss_weight', help='Classifier loss weight', type=float, default=0.001)
+    parser.add_argument('-llw','--latent_loss_weight', help='Latent loss weight', type=float, default=0.25)
 
     args = parser.parse_args()
 
@@ -270,6 +289,8 @@ if __name__ == '__main__':
         sys.stderr = open(os.path.join(expt_dir,'stderr.txt'), 'w')
         sys.stdout = open(os.path.join(expt_dir,'stdout.txt'), 'w')
 
+    print(args)
+    
     device = 'cuda'
 
     AUGMENT = args.augment
@@ -279,7 +300,8 @@ if __name__ == '__main__':
         train_transform = transforms.Compose(
             [
                 transforms.Resize(args.size),
-                transforms.CenterCrop(args.size),
+                transforms.RandomCrop(args.size),
+                #transforms.CenterCrop(args.size),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(
                     brightness=32./255.,
@@ -357,6 +379,7 @@ if __name__ == '__main__':
     
     model = nn.DataParallel(
             VQVAE(
+                input_size=args.size,
                 channel=args.channel,
                 embed_dim=args.embed_dim,
                 n_embed=args.n_embed, 
@@ -377,7 +400,7 @@ if __name__ == '__main__':
 
 
     for i in range(args.epoch):
-        train(i, loader, model, optimizer, scheduler, device, training_log, expt_dir)
+        train(i, loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight)
         evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir)
         torch.save(
             model.module.state_dict(), os.path.join(expt_dir, f'checkpoint/vqvae_{str(i + 1).zfill(3)}.pt')
