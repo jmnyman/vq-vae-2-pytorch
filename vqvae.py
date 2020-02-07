@@ -204,12 +204,13 @@ class VQVAE(nn.Module):
 
         self.dropout = nn.Dropout()
 
-        self.downsample_top_size = self.input_size / 2**(3+n_additional_downsample_layers)
+        self.downsample_top_size = int(self.input_size / 2**(3+n_additional_downsample_layers))
         self.unrolled_top_size = int(self.embed_dim * self.downsample_top_size**2)
 
         # CLASSIFIER [disabled by default with a scale of 0]
         self.num_classes = num_classes
-        self.classifier_fc = nn.Linear(self.unrolled_top_size, self.num_classes)
+        self.classifier_fc = nn.Linear(self.embed_dim, self.num_classes) # if not unrolling!
+        # self.classifier_fc = nn.Linear(self.unrolled_top_size, self.num_classes)
         self.cross_ent = nn.CrossEntropyLoss(reduction='sum')
 
     def forward(self, input, labels):
@@ -225,9 +226,17 @@ class VQVAE(nn.Module):
         enc_t = self.enc_t(enc_b)
 
         pre_quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1) # pre-actual quantization
+        # repeat labels to match enc_t's latent field dimensions [pointwise classification]
+        repeat_labels = labels.view(batch_size,1,1).repeat(1, self.downsample_top_size, self.downsample_top_size)
+        
         # New: run classifier on pre-quantized top level encoding
-        classifier_logits = self.classifier_fc(self.dropout(pre_quant_t.contiguous().view(batch_size,-1)))
-        classifier_loss = self.cross_ent(classifier_logits, labels.long()).unsqueeze(0)
+#         classifier_logits = self.classifier_fc(self.dropout(pre_quant_t.contiguous().view(batch_size,-1)))
+        classifier_logits = self.classifier_fc(self.dropout(pre_quant_t)) # if not unrolling!
+
+        # need unsqueeze(0) for dataparallel formatting
+#         classifier_loss = self.cross_ent(classifier_logits, labels.long()).unsqueeze(0)
+        # reshape again for crossent
+        classifier_loss = self.cross_ent(classifier_logits.permute(0,3,1,2), repeat_labels.long()).unsqueeze(0) 
         
         quant_t, diff_t, id_t = self.quantize_t(pre_quant_t)
         quant_t = quant_t.permute(0, 3, 1, 2)

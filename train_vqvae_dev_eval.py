@@ -108,6 +108,10 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,late
         )
         
         training_log.loc[(epoch,i),'train_loss'] = loss.item()
+        training_log.loc[(epoch,i),'train_recon_loss'] = recon_loss.item()
+        training_log.loc[(epoch,i),'train_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
+        training_log.loc[(epoch,i),'train_latent_loss'] = latent_loss_weight * latent_loss.item()
+
 
         if i % 100 == 0:
             model.eval()
@@ -161,7 +165,9 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
 
     mse_sum = 0
     mse_n = 0
-    
+    classifier_sum = 0 
+   
+
     enc_t_track = []
     enc_b_track = []
     label_track = []
@@ -181,9 +187,11 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
             mse_sum += recon_loss.item() * img.shape[0]
             mse_n += img.shape[0]
 
-            enc_t_track.append(enc_t.detach().cpu())
-            enc_b_track.append(enc_b.detach().cpu())
-            label_track.append(label)
+            classifier_sum += (classifier_loss_weight * classifier_loss.item())
+
+            #enc_t_track.append(enc_t.detach().cpu())
+            #enc_b_track.append(enc_b.detach().cpu())
+            #label_track.append(label)
 
             loader.set_description(
                 (
@@ -193,6 +201,12 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
                     f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 )
             )
+
+            training_log.loc[(epoch,i),'eval_loss'] = loss.item()
+            training_log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.item()
+            training_log.loc[(epoch,i),'eval_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
+            training_log.loc[(epoch,i),'eval_latent_loss'] = latent_loss_weight * latent_loss.item()
+
             if i % 100 == 0:
                 
                 sample = img[:sample_size]
@@ -223,23 +237,27 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
                 fig = pca_simple_vis(temp_enc_b_agg.view(enc_b.shape[0], -1), label)
                 fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
                 plt.close()
-    # aggregate PCA 
-    temp_enc_t_agg = torch.cat(enc_t_track).detach().cpu()
-    temp_enc_b_agg = torch.cat(enc_b_track).detach().cpu()
-    label_agg = np.concatenate(label_track)
 
-    fig = pca_simple_vis(temp_enc_t_agg.view(temp_enc_t_agg.shape[0], -1), label_agg) # unrolled entirely
-    # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
-    # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
-    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_top_vis.png'))
-    plt.close()
-    fig = pca_simple_vis(temp_enc_b_agg.view(temp_enc_b_agg.shape[0], -1), label_agg)
-    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_bot_vis.png'))
-    plt.close()
+    run_all_pca = False # for now since memory issues running as is
+    if run_all_pca:
+        # aggregate PCA 
+        temp_enc_t_agg = torch.cat(enc_t_track).detach().cpu()
+        temp_enc_b_agg = torch.cat(enc_b_track).detach().cpu()
+        label_agg = np.concatenate(label_track)
+
+        fig = pca_simple_vis(temp_enc_t_agg.view(temp_enc_t_agg.shape[0], -1), label_agg) # unrolled entirely
+        # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
+        # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
+        fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_top_vis.png'))
+        plt.close()
+        #fig = pca_simple_vis(temp_enc_b_agg.view(temp_enc_b_agg.shape[0], -1), label_agg)
+        #fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_bot_vis.png'))
+        #plt.close()
 
     model.train()
-    eval_mse_mean_epoch = mse_sum / mse_n
-    training_log.loc[epoch,'eval_loss'] = eval_mse_mean_epoch
+    #eval_mse_mean_epoch = mse_sum / mse_n
+    #training_log.loc[epoch,'eval_total_loss'] = eval_mse_mean_epoch
+    #training_log.loc[epoch,'eval_classifier_loss'] = classifier_sum / mse_n
 
 
 
@@ -262,10 +280,18 @@ if __name__ == '__main__':
             representation (prior to latent field representation/quantization)', type=int, default=128) # 'channel'
     parser.add_argument('-clw','--classifier_loss_weight', help='Classifier loss weight', type=float, default=0.001)
     parser.add_argument('-llw','--latent_loss_weight', help='Latent loss weight', type=float, default=0.25)
+    parser.add_argument('--full_size',help='Uncropped input tile size', default=512)
+    parser.add_argument('--seed', type=int, default=None, metavar='N', help='set a random seed for torch and numpy (default: None)')
 
     args = parser.parse_args()
 
     print(args)
+    # set random seed if specified
+    if type(args.seed) != None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        print('using random seed {}'.format(args.seed))
+
 
     # create timestamped experiment output 
     timestamp = get_timestamp()
@@ -299,7 +325,7 @@ if __name__ == '__main__':
         print('Using augmentations (RHF, CJ [defaults])')
         train_transform = transforms.Compose(
             [
-                transforms.Resize(args.size),
+                transforms.Resize(args.full_size),
                 transforms.RandomCrop(args.size),
                 #transforms.CenterCrop(args.size),
                 transforms.RandomHorizontalFlip(),
@@ -315,7 +341,7 @@ if __name__ == '__main__':
         )
         eval_transform = transforms.Compose(
             [
-                transforms.Resize(args.size),
+                transforms.Resize(args.full_size),
                 transforms.CenterCrop(args.size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
@@ -326,7 +352,7 @@ if __name__ == '__main__':
         print('Not using augmentations')
         train_transform = transforms.Compose(
             [
-                transforms.Resize(args.size),
+                transforms.Resize(args.full_size),
                 transforms.CenterCrop(args.size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
@@ -372,8 +398,8 @@ if __name__ == '__main__':
 
     dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df.is_kirc.values.astype(int), train_transform)
     dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.is_kirc.values.astype(int), eval_transform)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
+    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
 
     print('Using K={} codebook size'.format(args.n_embed))
     
@@ -401,7 +427,7 @@ if __name__ == '__main__':
 
     for i in range(args.epoch):
         train(i, loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight)
-        evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir)
+        evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir, args.classifier_loss_weight)
         torch.save(
             model.module.state_dict(), os.path.join(expt_dir, f'checkpoint/vqvae_{str(i + 1).zfill(3)}.pt')
         )
