@@ -16,6 +16,7 @@ import sys
 import os
 sys.path.append('/home/nyman/')
 from tmb_bot import utilities
+from tmb_bot.utilities import class_balance_sampler
 import pandas as pd
 import matplotlib.pyplot as plt
 sys.path.append('/home/nyman/histopath-analysis')
@@ -74,6 +75,9 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,late
     mse_n = 0
 
     for i, (img, label) in enumerate(loader):
+        #print('label ', label)
+        #label = np.array(label) # not sure why this was converting to tuple??
+
         model.zero_grad()
 
         img = img.to(device)
@@ -174,6 +178,8 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
 
     with torch.no_grad():
         for i, (img, label) in enumerate(loader):
+            #label = np.array(label) # in case tuple conversion again..
+
             model.zero_grad()
             img = img.to(device)
 
@@ -271,8 +277,8 @@ if __name__ == '__main__':
     parser.add_argument('-bs','--batch_size', type=int, default=100)
     parser.add_argument('-nal','--n_additional_layers', type=int, default=0)
     parser.add_argument('--augment', type=bool, default=False) 
-    parser.add_argument('--train_slides', type=int, default=10)
-    parser.add_argument('--dev_slides', type=int, default=5)
+    #parser.add_argument('--train_slides', type=int, default=10)
+    #parser.add_argument('--dev_slides', type=int, default=5)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--n_embed', help='vqvae2 `n_embed` param; codebook size', type=int, default=512) # 'n_embed'
     parser.add_argument('--embed_dim', help='vqvae2 `embed_dim` param; dimension/channels in pre-quantized latent field', type=int, default=64) # 'embed_dim'
@@ -280,9 +286,14 @@ if __name__ == '__main__':
             representation (prior to latent field representation/quantization)', type=int, default=128) # 'channel'
     parser.add_argument('-clw','--classifier_loss_weight', help='Classifier loss weight', type=float, default=0.001)
     parser.add_argument('-llw','--latent_loss_weight', help='Latent loss weight', type=float, default=0.25)
-    parser.add_argument('--full_size',help='Uncropped input tile size', default=512)
+    parser.add_argument('--full_size',type=int, help='Uncropped input tile size', default=512)
     parser.add_argument('--seed', type=int, default=None, metavar='N', help='set a random seed for torch and numpy (default: None)')
 
+    parser.add_argument('--paths_df', type=str, help='file path of dataframe with ids/tile paths')
+    parser.add_argument('--train_ids', type=str, help='file path of list of IDs in train set')
+    parser.add_argument('--dev_ids', type=str, help='file path of list of IDs in validation (dev) set')
+    parser.add_argument('-tps','--tiles_per_slide', type=int, default=50, help='if specified, num. tiles to sample per slide')
+    parser.add_argument('--balance_var', type=str, default='is_kirc', help='paths_df column on which to groupby to evenly sample from')
     args = parser.parse_args()
 
     print(args)
@@ -361,46 +372,41 @@ if __name__ == '__main__':
         eval_transform = train_transform
     
 
-    # manual hardcoding
-    paths_df = pd.read_pickle('/home/nyman/20191025_dfci_full_rcc_paths_df_annotated_reexport.pkl') # tried exporting above in `rapids` conda env
-    partial_indicator = pd.read_csv('/home/nyman/20191025_dfci_full_rcc_paths_df_annotated_jupyterexport_PARTIAL_TILE_INDICATOR.csv')
-    # subset out tiles that aren't 512x512 
-    paths_df = paths_df.loc[partial_indicator['is_512'].values]
+    try:
+        paths_df = pd.read_pickle(args.paths_df)
+    except:
+        paths_df = pd.read_csv(args.paths_df)
+        paths_df = paths_df.set_index(paths_df.columns[0])
 
-    # subset by clearcell vs nonclearcell and sample evenly
-    print('evenly splitting b/t kirc/nonkirc slides')
     paths_df.index.name = 'idx'
-    data_anno = paths_df.reset_index().drop_duplicates('idx')
-    all_ids_subset = data_anno.groupby('is_kirc').apply(lambda x: x.sample(int(2*args.train_slides))).reset_index(0, drop=True)
-    all_ids_subset = all_ids_subset['idx'].values
-    print(all_ids_subset.shape)
-    
-    # subset and only take a few slides
-    train_ids = pd.Series(all_ids_subset).sample(args.train_slides)
+
+    train_ids = pd.read_csv(args.train_ids, header=None).iloc[:,1].values
+    dev_ids = pd.read_csv(args.dev_ids, header=None).iloc[:,1].values
+
     train_paths_df = paths_df.loc[train_ids]
+    dev_paths_df = paths_df.loc[dev_ids]
 
-    # grab a set of slides to evaluate during training 
-    #dev_subset = paths_df.drop(subset_ids.values)
-    dev_subset = [x for x in all_ids_subset if x not in train_ids.values]
-    dev_subset_ids = pd.Series(dev_subset).sample(args.dev_slides)
-    dev_paths_df = paths_df.loc[dev_subset_ids]
-    
-    train_ids.to_csv(os.path.join(expt_dir, 'train_slide_ids.csv'))
-    dev_subset_ids.to_csv(os.path.join(expt_dir, 'dev_slide_ids.csv'))
+    if args.tiles_per_slide != -1:
+        num_true = args.tiles_per_slide
+        num_false = args.tiles_per_slide
+        pred_variable = args.balance_var
 
-    print('Train Subset DF size: ', train_paths_df.shape)
-    print('Dev Subset DF size: ', dev_paths_df.shape)
+        train_paths_df = train_paths_df.reset_index().groupby('idx').apply(
+                lambda x: class_balance_sampler(x, num_true, num_false, pred_variable))
+        dev_paths_df = dev_paths_df.reset_index().groupby('idx').apply(
+                lambda x: class_balance_sampler(x, num_true, num_false, pred_variable))
 
-    print('train balance: ', train_paths_df.is_kirc.mean())
-    print('dev balance: ', dev_paths_df.is_kirc.mean())
-
-    # TODO add subsampling via controlling # tiles per slide sampled....
-
-    dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df.is_kirc.values.astype(int), train_transform)
-    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.is_kirc.values.astype(int), eval_transform)
+    print(train_paths_df.head())
+    print(dev_paths_df.head())
+    # @TODO dataset with labels and names that can be specified, rather than a single target
+    dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df[args.balance_var].values, train_transform)
+    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df[args.balance_var].values, eval_transform)
+    #dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df.index.values, train_transform)
+    #dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.index.values, eval_transform)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
 
+    print(len(dataset), len(dev_dataset))
     print('Using K={} codebook size'.format(args.n_embed))
     
     model = nn.DataParallel(
