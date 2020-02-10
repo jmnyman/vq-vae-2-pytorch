@@ -213,11 +213,14 @@ class VQVAE(nn.Module):
         # self.classifier_fc = nn.Linear(self.unrolled_top_size, self.num_classes)
         self.cross_ent = nn.CrossEntropyLoss(reduction='sum')
 
+        self.mse_loss = nn.MSELoss()
+
     def forward(self, input, labels):
         quant_t, quant_b, diff, _, _, enc_t, enc_b, classifier_loss = self.encode(input, labels)
         dec = self.decode(quant_t, quant_b)
+        recon_loss = self.mse_loss(dec, input)
 
-        return dec, diff, enc_t, enc_b, classifier_loss
+        return dec, diff, enc_t, enc_b, classifier_loss, recon_loss
 
     def encode(self, input, labels):
         batch_size = input.shape[0]
@@ -256,6 +259,152 @@ class VQVAE(nn.Module):
         upsample_t = self.upsample_t(quant_t)
         quant = torch.cat([upsample_t, quant_b], 1)
         dec = self.dec(quant)
+
+        return dec
+
+    def decode_code(self, code_t, code_b):
+        quant_t = self.quantize_t.embed_code(code_t)
+        quant_t = quant_t.permute(0, 3, 1, 2)
+        quant_b = self.quantize_b.embed_code(code_b)
+        quant_b = quant_b.permute(0, 3, 1, 2)
+
+        dec = self.decode(quant_t, quant_b)
+
+        return dec
+
+
+class ThreeLevelVQVAE(nn.Module):
+    def __init__(
+            self,
+            in_channel=3,
+            channel=128,
+            n_res_block=2,
+            n_res_channel=32,
+            embed_dim=64,
+            n_embed=512,
+            decay=0.99,
+            n_additional_downsample_layers=3,
+            n_additional_upsample_layers=3,
+            num_classes=2,
+            input_size=512,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.embed_dim = embed_dim
+
+        # TODO add middle latent layer encoder, conv2d, quantize, decoder, (more?)
+        # TODO upsample/downsample
+        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, 4, n_additional_downsample_layers)
+        self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, 2, 0)
+        self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
+        self.quantize_t = Quantize(embed_dim, n_embed)
+        self.dec_t = Decoder(
+            embed_dim, embed_dim, channel, n_res_block, n_res_channel, 2, n_additional_upsample_layers=0
+        )
+        self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
+        self.quantize_b = Quantize(embed_dim, n_embed)
+        self.upsample_t = nn.ConvTranspose2d(
+            embed_dim, embed_dim, 4, stride=2, padding=1
+        )
+        self.dec = Decoder(
+            embed_dim + embed_dim,
+            in_channel,
+            channel,
+            n_res_block,
+            n_res_channel,
+            4,
+            n_additional_upsample_layers
+        )
+
+        self.dropout = nn.Dropout()
+
+        self.downsample_top_size = int(self.input_size / 2 ** (3 + n_additional_downsample_layers))
+        self.unrolled_top_size = int(self.embed_dim * self.downsample_top_size ** 2)
+
+        # CLASSIFIER [disabled by default with a scale of 0]
+        self.num_classes = num_classes
+        self.classifier_fc = nn.Linear(self.embed_dim, self.num_classes)  # if not unrolling!
+        # self.classifier_fc = nn.Linear(self.unrolled_top_size, self.num_classes)
+        self.cross_ent = nn.CrossEntropyLoss(reduction='sum')
+
+    def forward(self, input, labels):
+        # TODO match base model
+        quant_t, quant_b, diff, _, _, enc_t, enc_b, classifier_loss = self.encode(input, labels)
+        dec = self.decode(quant_t, quant_b)
+
+        return dec, diff, enc_t, enc_b, classifier_loss
+
+    def encode(self, input, labels):
+        batch_size = input.shape[0]
+
+        # obtain first representations for each latent layer (each will be added to via concatenation)
+        enc_b = self.enc_b(input)
+        enc_m = self.enc_m(enc_b)
+        enc_t = self.enc_t(enc_m)
+
+        # transform, quantize, and decode top latent layer; run classifier on prequantized representation
+        pre_quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)  # pre-actual quantization
+        # repeat labels to match enc_t's latent field dimensions [pointwise classification]
+        repeat_labels = labels.view(batch_size, 1, 1).repeat(1, self.downsample_top_size, self.downsample_top_size)
+        # run classifier on pre-quantized top level encoding
+        classifier_logits = self.classifier_fc(self.dropout(pre_quant_t))  # if not unrolling!
+        # reshape again for crossent
+        classifier_loss = self.cross_ent(classifier_logits.permute(0, 3, 1, 2), repeat_labels.long()).unsqueeze(0)
+
+        # quantize top layer and decode
+        quant_t, diff_t, id_t = self.quantize_t(pre_quant_t)
+        quant_t = quant_t.permute(0, 3, 1, 2)
+        diff_t = diff_t.unsqueeze(0)
+        dec_t = self.dec_t(quant_t)
+
+        # combine decoded top layer with first representation of middle latent layer
+        enc_m = torch.cat([dec_t, enc_m], 1)
+
+        # transform, quantize, and decode middle latent field
+        pre_quant_m = self.quantize_conv_m(enc_m).permute(0, 2, 3, 1)  # pre-actual quantization
+        quant_m, diff_m, id_m = self.quantize_m(pre_quant_m)
+        quant_m = quant_m.permute(0, 3, 1, 2)
+        diff_m = diff_m.unsqueeze(0)
+
+        # combine decoded middle layer with first representation of bottom latent layer
+        enc_b = torch.cat([dec_m, enc_b], 1)
+
+        pre_quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
+        quant_b, diff_b, id_b = self.quantize_b(pre_quant_b)  # I renamed to avoid confusion; not sure performance hit
+        quant_b = quant_b.permute(0, 3, 1, 2)
+        diff_b = diff_b.unsqueeze(0)
+
+        # TODO clean up output format -- dictionary?
+        return quant_t, quant_b, diff_t + diff_b, id_t, id_b, enc_t, enc_b, classifier_loss
+
+    def decode(self, quant_t, quant_m, quant_b):
+        """
+        General process here is to take the highest level representation (embedding form of quantized category assignment)
+        and then to upsample this representation to match the spatial resolution of the next "lower" layer
+        then combine these representations via concat
+
+        I'm not 100% sure on the distinction between upsample and decoder operations under the source
+        implementation's use....
+
+        Maybe it's just concat[upsample_t, upsample_m, quant_b], where both upsamplings map to the same dim as bottom layer
+        ( see below )
+
+        :param quant_t:
+        :param quant_m:
+        :param quant_b:
+        :return:
+        """
+        # upsample_t = self.upsample_t(quant_t)
+        # quant_tm = torch.cat([upsample_t, quant_m], 1)
+        # dec_m = self.dec_m(quant_tm)
+        # upsample_m = upsample_m(dec_m) # Not sure about this
+        # quant_mb = torch.cat([upsample_m, quant_b], 1)
+        # dec = self.dec(quant_mb)
+
+        upsample_t = self.upsample_t(quant_t)
+        upsample_m = self.upsample_m(quant_m)
+        combined_quant = torch.cat([upsample_t, upsample_m, quant_t], 1)
+        dec = self.dec(combined_quant)
 
         return dec
 

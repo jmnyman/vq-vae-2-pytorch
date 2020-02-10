@@ -3,11 +3,9 @@ import argparse
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-
 from torchvision import datasets, transforms, utils
-
+from torch.utils import data
 from tqdm import tqdm
-
 from vqvae import VQVAE
 from scheduler import CycleScheduler
 
@@ -62,34 +60,61 @@ def umap_simple_vis(umap_scores, label_store, alpha=0.3, legend=True, **kwargs):
     
     return g
 
-def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,latent_loss_weight=0.25, classifier_loss_weight=0.001):
+class SlideDataset(data.Dataset):
+    """
+    Modification of vanilla `tmb_bot.utilities.Dataset` class to facilitate having
+    a label for classification as well as the slide name itself
+    """
+
+    def __init__(self, paths, slide_ids, labels, transform_compose):
+        """
+        Paths and labels should be array like
+        """
+        self.paths = paths
+        self.slide_ids = slide_ids
+        self.labels = labels
+        self.transform = transform_compose
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return self.paths.shape[0]
+
+    def __getitem__(self, index):
+        'Generates one sample of data'
+        img_path = self.paths[index]
+        pil_file = pil_loader(img_path)
+        pil_file = self.transform(pil_file)
+        slide_id = self.slide_ids[index]
+        label = self.labels[index]
+
+        return pil_file, label, slide_id
+
+
+def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, latent_loss_weight=0.25,
+          classifier_loss_weight=0.001):
     loader = tqdm(loader)
 
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss() # TODO Remove once working within forward
 
-    #latent_loss_weight = 0.25
-    #classifier_loss_weight = 0.001 # no idea what to put as for now
-    sample_size = 25
+    sample_size = loader.batch_size
 
     mse_sum = 0
     mse_n = 0
 
-    for i, (img, label) in enumerate(loader):
-        #print('label ', label)
-        #label = np.array(label) # not sure why this was converting to tuple??
-
+    for i, (img, label, slide_id) in enumerate(loader):
         model.zero_grad()
 
         img = img.to(device)
 
-        out, latent_loss, enc_t, enc_b, classifier_loss = model(img, label)
-        
-        recon_loss = criterion(out, img)
-        latent_loss = latent_loss.mean()
-        classifier_loss = classifier_loss.mean() # multi GPU 
+        out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
 
-        # TODO possibly also add a classifier term here (would require adding module to model itself as well)
+        # TODO move criterion eval to within model forward to facilitate even GPU memory usage in dataparallel
+        # recon_loss = criterion(out, img)
+        # latent_loss = latent_loss.mean()
+        # classifier_loss = classifier_loss.mean()  # multi GPU
+
         loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
+        loss = loss.mean()  # collapse multi GPU output format
         loss.backward()
 
         if scheduler is not None:
@@ -110,21 +135,20 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,late
                 f'lr: {lr:.5f}'
             )
         )
-        
-        training_log.loc[(epoch,i),'train_loss'] = loss.item()
-        training_log.loc[(epoch,i),'train_recon_loss'] = recon_loss.item()
-        training_log.loc[(epoch,i),'train_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
-        training_log.loc[(epoch,i),'train_latent_loss'] = latent_loss_weight * latent_loss.item()
 
+        log.loc[(epoch, i), 'train_loss'] = loss.item()
+        log.loc[(epoch, i), 'train_recon_loss'] = recon_loss.item()
+        log.loc[(epoch, i), 'train_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
+        log.loc[(epoch, i), 'train_latent_loss'] = latent_loss_weight * latent_loss.item()
 
         if i % 100 == 0:
             model.eval()
-            
+
             sample = img[:sample_size]
 
-            #with torch.no_grad():
+            # with torch.no_grad():
             #    out, _ = model(sample)
-            
+
             # my edit to visualize PRE gradient step decoding
             out = out[:sample_size].detach()
 
@@ -138,7 +162,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,late
 
             # visualize pre-quantized encodings
             # plot 2 component PCA vis of latent encodings
-            fig = pca_simple_vis(enc_t.detach().cpu().view(enc_t.shape[0], -1), label) # unrolled entirely
+            fig = pca_simple_vis(enc_t.detach().cpu().view(enc_t.shape[0], -1), label)  # unrolled entirely
             # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
             # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
             fig.savefig(os.path.join(expt_dir, f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_top_vis.png'))
@@ -149,45 +173,32 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir,late
 
             model.train()
 
-    # TODO dev_loader eval code [at end of each epoch] 
-    # TODO perhaps just make this a separate function to call...
-    #train_mse_mean_epoch = mse_sum / mse_n
-    #training_log.loc[(epoch, i),'train_loss'] = train_mse_mean_epoch
 
 def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_weight=0.25, classifier_loss_weight=0.001):
     """
     Just taking above train function and removing any gradient updates etc
     """
     model.eval()
-
     loader = tqdm(loader)
-
     criterion = nn.MSELoss()
-
-    #latent_loss_weight = 0.25
-    sample_size = 25
+    sample_size = loader.batch_size
 
     mse_sum = 0
     mse_n = 0
-    classifier_sum = 0 
-   
+    classifier_sum = 0
 
     enc_t_track = []
     enc_b_track = []
     label_track = []
 
     with torch.no_grad():
-        for i, (img, label) in enumerate(loader):
-            #label = np.array(label) # in case tuple conversion again..
-
-            model.zero_grad()
+        for i, (img, label, slide_id) in enumerate(loader):
             img = img.to(device)
 
             out, latent_loss, enc_t, enc_b, classifier_loss = model(img, label)
             recon_loss = criterion(out, img)
             latent_loss = latent_loss.mean()
             classifier_loss = classifier_loss.mean()
-            # TODO possibly also add a classifier term here (would require adding module to model itself as well)
             loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
 
             mse_sum += recon_loss.item() * img.shape[0]
@@ -208,10 +219,10 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
                 )
             )
 
-            training_log.loc[(epoch,i),'eval_loss'] = loss.item()
-            training_log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.item()
-            training_log.loc[(epoch,i),'eval_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
-            training_log.loc[(epoch,i),'eval_latent_loss'] = latent_loss_weight * latent_loss.item()
+            log.loc[(epoch,i),'eval_loss'] = loss.item()
+            log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.item()
+            log.loc[(epoch,i),'eval_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
+            log.loc[(epoch,i),'eval_latent_loss'] = latent_loss_weight * latent_loss.item()
 
             if i % 100 == 0:
                 
@@ -252,8 +263,6 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
         label_agg = np.concatenate(label_track)
 
         fig = pca_simple_vis(temp_enc_t_agg.view(temp_enc_t_agg.shape[0], -1), label_agg) # unrolled entirely
-        # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
-        # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
         fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_agg_enc_top_vis.png'))
         plt.close()
         #fig = pca_simple_vis(temp_enc_b_agg.view(temp_enc_b_agg.shape[0], -1), label_agg)
@@ -261,11 +270,6 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
         #plt.close()
 
     model.train()
-    #eval_mse_mean_epoch = mse_sum / mse_n
-    #training_log.loc[epoch,'eval_total_loss'] = eval_mse_mean_epoch
-    #training_log.loc[epoch,'eval_classifier_loss'] = classifier_sum / mse_n
-
-
 
 
 if __name__ == '__main__':
@@ -274,31 +278,36 @@ if __name__ == '__main__':
     parser.add_argument('--epoch', type=int, default=50)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--sched', type=str)
-    parser.add_argument('-bs','--batch_size', type=int, default=100)
-    parser.add_argument('-nal','--n_additional_layers', type=int, default=0)
-    parser.add_argument('--augment', type=bool, default=False) 
-    #parser.add_argument('--train_slides', type=int, default=10)
-    #parser.add_argument('--dev_slides', type=int, default=5)
+    parser.add_argument('-bs', '--batch_size', type=int, default=100)
+    parser.add_argument('-nal', '--n_additional_layers', type=int, default=0)
+    parser.add_argument('--augment', type=bool, default=False)
+    # parser.add_argument('--train_slides', type=int, default=10)
+    # parser.add_argument('--dev_slides', type=int, default=5)
     parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--n_embed', help='vqvae2 `n_embed` param; codebook size', type=int, default=512) # 'n_embed'
-    parser.add_argument('--embed_dim', help='vqvae2 `embed_dim` param; dimension/channels in pre-quantized latent field', type=int, default=64) # 'embed_dim'
+    parser.add_argument('--n_embed', help='vqvae2 `n_embed` param; codebook size', type=int, default=512)  # 'n_embed'
+    parser.add_argument('--embed_dim',
+                        help='vqvae2 `embed_dim` param; dimension/channels in pre-quantized latent field', type=int,
+                        default=64)  # 'embed_dim'
     parser.add_argument('--channel', help='vqvae2 `channel` param; number of channels in the hidden \
-            representation (prior to latent field representation/quantization)', type=int, default=128) # 'channel'
-    parser.add_argument('-clw','--classifier_loss_weight', help='Classifier loss weight', type=float, default=0.001)
-    parser.add_argument('-llw','--latent_loss_weight', help='Latent loss weight', type=float, default=0.25)
-    parser.add_argument('--full_size',type=int, help='Uncropped input tile size', default=512)
-    parser.add_argument('--seed', type=int, default=None, metavar='N', help='set a random seed for torch and numpy (default: None)')
+            representation (prior to latent field representation/quantization)', type=int, default=128)  # 'channel'
+    parser.add_argument('-clw', '--classifier_loss_weight', help='Classifier loss weight', type=float, default=0.001)
+    parser.add_argument('-llw', '--latent_loss_weight', help='Latent loss weight', type=float, default=0.25)
+    parser.add_argument('--full_size', type=int, help='Uncropped input tile size', default=512)
+    parser.add_argument('--seed', type=int, default=None, metavar='N',
+                        help='set a random seed for torch and numpy (default: None)')
 
     parser.add_argument('--paths_df', type=str, help='file path of dataframe with ids/tile paths')
     parser.add_argument('--train_ids', type=str, help='file path of list of IDs in train set')
     parser.add_argument('--dev_ids', type=str, help='file path of list of IDs in validation (dev) set')
-    parser.add_argument('-tps','--tiles_per_slide', type=int, default=50, help='if specified, num. tiles to sample per slide')
-    parser.add_argument('--balance_var', type=str, default='is_kirc', help='paths_df column on which to groupby to evenly sample from')
+    parser.add_argument('-tps', '--tiles_per_slide', type=int, default=50,
+                        help='if specified, num. tiles to sample per slide')
+    parser.add_argument('--balance_var', type=str, default='is_kirc',
+                        help='paths_df column on which to groupby to evenly sample from')
     args = parser.parse_args()
 
     print(args)
     # set random seed if specified
-    if type(args.seed) != None:
+    if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         print('using random seed {}'.format(args.seed))
@@ -350,7 +359,7 @@ if __name__ == '__main__':
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
             ]
         )
-        eval_transform = transforms.Compose(
+        dev_transform = transforms.Compose(
             [
                 transforms.Resize(args.full_size),
                 transforms.CenterCrop(args.size),
@@ -369,7 +378,7 @@ if __name__ == '__main__':
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
             ]
         )
-        eval_transform = train_transform
+        dev_transform = train_transform
     
 
     try:
@@ -386,6 +395,7 @@ if __name__ == '__main__':
     train_paths_df = paths_df.loc[train_ids]
     dev_paths_df = paths_df.loc[dev_ids]
 
+    # TODO find a cleaner way to flag when we don't want to use this arg (instead of checking != -1)
     if args.tiles_per_slide != -1:
         num_true = args.tiles_per_slide
         num_false = args.tiles_per_slide
@@ -396,17 +406,22 @@ if __name__ == '__main__':
         dev_paths_df = dev_paths_df.reset_index().groupby('idx').apply(
                 lambda x: class_balance_sampler(x, num_true, num_false, pred_variable))
 
-    print(train_paths_df.head())
-    print(dev_paths_df.head())
-    # @TODO dataset with labels and names that can be specified, rather than a single target
-    dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df[args.balance_var].values, train_transform)
-    dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df[args.balance_var].values, eval_transform)
-    #dataset = utilities.Dataset(train_paths_df.full_path.values, train_paths_df.index.values, train_transform)
-    #dev_dataset = utilities.Dataset(dev_paths_df.full_path.values, dev_paths_df.index.values, eval_transform)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
+    train_dataset = SlideDataset(
+        paths=train_paths_df.full_path.values,
+        slide_ids=train_paths_df.index.values,
+        labels=train_paths_df[args.balance_var].values,
+        transform_compose=train_transform
+    )
+    dev_dataset = SlideDataset(
+        paths=dev_paths_df.full_path.values,
+        slide_ids=dev_paths_df.index.values,
+        labels=dev_paths_df[args.balance_var].values,
+        transform_compose=dev_transform
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
 
-    print(len(dataset), len(dev_dataset))
+    print(len(train_dataset), len(dev_dataset))
     print('Using K={} codebook size'.format(args.n_embed))
     
     model = nn.DataParallel(
@@ -424,7 +439,7 @@ if __name__ == '__main__':
     scheduler = None
     if args.sched == 'cycle':
         scheduler = CycleScheduler(
-            optimizer, args.lr, n_iter=len(loader) * args.epoch, momentum=None
+            optimizer, args.lr, n_iter=len(train_loader) * args.epoch, momentum=None
         )
 
     training_log = pd.DataFrame(columns=[
@@ -432,7 +447,7 @@ if __name__ == '__main__':
 
 
     for i in range(args.epoch):
-        train(i, loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight)
+        train(i, train_loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight)
         evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir, args.classifier_loss_weight)
         torch.save(
             model.module.state_dict(), os.path.join(expt_dir, f'checkpoint/vqvae_{str(i + 1).zfill(3)}.pt')
