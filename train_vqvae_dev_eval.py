@@ -14,7 +14,7 @@ import sys
 import os
 sys.path.append('/home/nyman/')
 from tmb_bot import utilities
-from tmb_bot.utilities import class_balance_sampler
+from tmb_bot.utilities import class_balance_sampler, pil_loader
 import pandas as pd
 import matplotlib.pyplot as plt
 sys.path.append('/home/nyman/histopath-analysis')
@@ -92,26 +92,28 @@ class SlideDataset(data.Dataset):
 
 def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, latent_loss_weight=0.25,
           classifier_loss_weight=0.001):
+    sample_size = loader.batch_size
     loader = tqdm(loader)
 
     # criterion = nn.MSELoss() # TODO Remove once working within forward
-
-    sample_size = loader.batch_size
-
     mse_sum = 0
     mse_n = 0
 
     for i, (img, label, slide_id) in enumerate(loader):
         model.zero_grad()
 
-        img = img.to(device)
+        # img = img.to(device)
 
-        out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
+        #out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
+        #out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
+        #latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
+        #latent_loss, _, _, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
+       
+        # try just returning losses and latent code IDs for a lighter memory output (to ease up gather size for GPU0) 
+        # latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img.cuda(), label.cuda())
 
-        # TODO move criterion eval to within model forward to facilitate even GPU memory usage in dataparallel
-        # recon_loss = criterion(out, img)
-        # latent_loss = latent_loss.mean()
-        # classifier_loss = classifier_loss.mean()  # multi GPU
+        # now see if letting model figure out cuda assignment helps / if we don't need to call `.cuda()`
+        latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img, label) # dont think it matters with dataparallel!
 
         loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
         loss = loss.mean()  # collapse multi GPU output format
@@ -121,28 +123,36 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
             scheduler.step()
         optimizer.step()
 
-        mse_sum += recon_loss.item() * img.shape[0]
-        mse_n += img.shape[0]
+        with torch.no_grad():
+            mse_sum += (recon_loss * img.shape[0]).mean().item()
+            mse_n += img.shape[0]
 
         lr = optimizer.param_groups[0]['lr']
 
         loader.set_description(
             (
                 f'train; '
-                f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
-                f'classifier: {classifier_loss_weight * classifier_loss.item():.3f}; '
-                f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
+                f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
+                f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
+                f'latent: {latent_loss.mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 f'lr: {lr:.5f}'
             )
         )
 
         log.loc[(epoch, i), 'train_loss'] = loss.item()
-        log.loc[(epoch, i), 'train_recon_loss'] = recon_loss.item()
-        log.loc[(epoch, i), 'train_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
-        log.loc[(epoch, i), 'train_latent_loss'] = latent_loss_weight * latent_loss.item()
+        log.loc[(epoch, i), 'train_recon_loss'] = recon_loss.mean().item()
+        log.loc[(epoch, i), 'train_classifier_loss'] = (classifier_loss_weight * classifier_loss).mean().item()
+        log.loc[(epoch, i), 'train_latent_loss'] = (latent_loss_weight * latent_loss).mean().item()
+
+        
 
         if i % 100 == 0:
+        #if i is None: # block for now while troubleshooting
             model.eval()
+                
+            # my addition to try to just decode from category IDs instead
+            with torch.no_grad():
+                out = model.module.decode_code(id_t, id_b).cpu()
 
             sample = img[:sample_size]
 
@@ -150,7 +160,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
             #    out, _ = model(sample)
 
             # my edit to visualize PRE gradient step decoding
-            out = out[:sample_size].detach()
+            # out = out[:sample_size].cpu().detach()
 
             utils.save_image(
                 torch.cat([sample, out], 0),
@@ -160,16 +170,16 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
                 range=(-1, 1),
             )
 
-            # visualize pre-quantized encodings
-            # plot 2 component PCA vis of latent encodings
-            fig = pca_simple_vis(enc_t.detach().cpu().view(enc_t.shape[0], -1), label)  # unrolled entirely
-            # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
-            # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
-            fig.savefig(os.path.join(expt_dir, f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_top_vis.png'))
-            plt.close()
-            fig = pca_simple_vis(enc_b.detach().cpu().view(enc_b.shape[0], -1), label)
-            fig.savefig(os.path.join(expt_dir, f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
-            plt.close()
+            DO_PCA = False 
+            if DO_PCA:
+                # visualize pre-quantized encodings
+                # plot 2 component PCA vis of latent encodings
+                fig = pca_simple_vis(enc_t.detach().cpu().view(enc_t.shape[0], -1), label)  # unrolled entirely
+                fig.savefig(os.path.join(expt_dir, f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_top_vis.png'))
+                plt.close()
+                fig = pca_simple_vis(enc_b.detach().cpu().view(enc_b.shape[0], -1), label)
+                fig.savefig(os.path.join(expt_dir, f'sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
+                plt.close()
 
             model.train()
 
@@ -179,9 +189,9 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
     Just taking above train function and removing any gradient updates etc
     """
     model.eval()
-    loader = tqdm(loader)
-    criterion = nn.MSELoss()
     sample_size = loader.batch_size
+    loader = tqdm(loader)
+    # criterion = nn.MSELoss()
 
     mse_sum = 0
     mse_n = 0
@@ -193,18 +203,23 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
 
     with torch.no_grad():
         for i, (img, label, slide_id) in enumerate(loader):
-            img = img.to(device)
+            # img = img.to(device)
 
-            out, latent_loss, enc_t, enc_b, classifier_loss = model(img, label)
-            recon_loss = criterion(out, img)
-            latent_loss = latent_loss.mean()
-            classifier_loss = classifier_loss.mean()
+            #out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
+            #latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
+            #latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img.cuda(), label.cuda())
+            latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img, label)
+
+            # recon_loss = criterion(out, img)
+            #latent_loss = latent_loss.mean()
+            #classifier_loss = classifier_loss.mean()
             loss = recon_loss + (latent_loss_weight * latent_loss) + (classifier_loss_weight * classifier_loss)
+            loss = loss.mean()
 
-            mse_sum += recon_loss.item() * img.shape[0]
+            mse_sum += (recon_loss * img.shape[0]).mean().item()
             mse_n += img.shape[0]
 
-            classifier_sum += (classifier_loss_weight * classifier_loss.item())
+            classifier_sum += (classifier_loss_weight * classifier_loss).mean().item()
 
             #enc_t_track.append(enc_t.detach().cpu())
             #enc_b_track.append(enc_b.detach().cpu())
@@ -213,21 +228,25 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
             loader.set_description(
                 (
                     f'eval; '
-                    f'epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; '
-                    f'classifier: {classifier_loss_weight * classifier_loss.item():.3f}; '
-                    f'latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
+                    f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
+                    f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
+                    f'latent: {latent_loss.mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
                 )
             )
 
             log.loc[(epoch,i),'eval_loss'] = loss.item()
-            log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.item()
-            log.loc[(epoch,i),'eval_classifier_loss'] = classifier_loss_weight * classifier_loss.item()
-            log.loc[(epoch,i),'eval_latent_loss'] = latent_loss_weight * latent_loss.item()
+            log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.mean().item()
+            log.loc[(epoch,i),'eval_classifier_loss'] = (classifier_loss_weight * classifier_loss).mean().item()
+            log.loc[(epoch,i),'eval_latent_loss'] = (latent_loss_weight * latent_loss).mean().item()
+
 
             if i % 100 == 0:
-                
+                with torch.no_grad():
+                    out = model.module.decode_code(id_t, id_b).cpu()
+
                 sample = img[:sample_size]
-                out = out[:sample_size].detach()
+                #out = out[:sample_size].detach()
+                #out = out[:sample_size].cpu().detach()
 
                 utils.save_image(
                     torch.cat([sample, out], 0),
@@ -236,24 +255,25 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
                     normalize=True,
                     range=(-1, 1),
                 )
+                DO_PCA = False 
+                if DO_PCA:
+                    # visualize pre-quantized encodings
+                    # plot 2 component PCA vis of latent encodings
+                    
+                    # too large for now... 
+                    #temp_enc_b_agg = torch.cat(enc_b_track)
+                    #temp_enc_t_agg = torch.cat(enc_t_track)
+                    temp_enc_t_agg = enc_t.detach().cpu()
+                    temp_enc_b_agg = enc_b.detach().cpu()
 
-                # visualize pre-quantized encodings
-                # plot 2 component PCA vis of latent encodings
-                
-                # too large for now... 
-                #temp_enc_b_agg = torch.cat(enc_b_track)
-                #temp_enc_t_agg = torch.cat(enc_t_track)
-                temp_enc_t_agg = enc_t.detach().cpu()
-                temp_enc_b_agg = enc_b.detach().cpu()
-
-                fig = pca_simple_vis(temp_enc_t_agg.view(enc_t.shape[0], -1), label) # unrolled entirely
-                # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
-                # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
-                fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_top_vis.png'))
-                plt.close()
-                fig = pca_simple_vis(temp_enc_b_agg.view(enc_b.shape[0], -1), label)
-                fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
-                plt.close()
+                    fig = pca_simple_vis(temp_enc_t_agg.view(enc_t.shape[0], -1), label) # unrolled entirely
+                    # @ TODO modify / repeat labels to match the latent field unrolled size (ie, 32x32 unrolled)
+                    # fig = pca_simple_vis(enc_t.detach().cpu().view(-1, enc_t.shape[1]), label) # each latent field point separately
+                    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_top_vis.png'))
+                    plt.close()
+                    fig = pca_simple_vis(temp_enc_b_agg.view(enc_b.shape[0], -1), label)
+                    fig.savefig(os.path.join(expt_dir, f'sample/eval_set_{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_enc_bot_vis.png'))
+                    plt.close()
 
     run_all_pca = False # for now since memory issues running as is
     if run_all_pca:
@@ -434,6 +454,7 @@ if __name__ == '__main__':
                 n_additional_upsample_layers=args.n_additional_layers
                 )
             ).to(device)
+            #) # not sure if `to(device)` is the issue
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = None

@@ -216,11 +216,17 @@ class VQVAE(nn.Module):
         self.mse_loss = nn.MSELoss()
 
     def forward(self, input, labels):
-        quant_t, quant_b, diff, _, _, enc_t, enc_b, classifier_loss = self.encode(input, labels)
+        # TODO don't return decoding; instead recreate decoding when asked via model.decode_code` instead
+        quant_t, quant_b, diff, id_t, id_b, enc_t, enc_b, classifier_loss = self.encode(input, labels)
         dec = self.decode(quant_t, quant_b)
         recon_loss = self.mse_loss(dec, input)
 
-        return dec, diff, enc_t, enc_b, classifier_loss, recon_loss
+        #return dec, diff, enc_t, enc_b, classifier_loss, recon_loss
+        #return diff, enc_t, enc_b, classifier_loss, recon_loss
+        #return diff, classifier_loss, recon_loss # try only returning losses to reduce gathered memory?
+        
+        return diff, classifier_loss, recon_loss, id_t, id_b
+
 
     def encode(self, input, labels):
         batch_size = input.shape[0]
