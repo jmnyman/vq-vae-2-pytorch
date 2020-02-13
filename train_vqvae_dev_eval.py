@@ -91,26 +91,23 @@ class SlideDataset(data.Dataset):
 
 
 def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, latent_loss_weight=0.25,
-          classifier_loss_weight=0.001):
+          classifier_loss_weight=0.001, early_stop_thresh=20):
     sample_size = loader.batch_size
     loader = tqdm(loader)
 
-    # criterion = nn.MSELoss() # TODO Remove once working within forward
     mse_sum = 0
     mse_n = 0
 
+    stopped_early = False # until we reach criterion, keep as False
+    early_stop_counter = 0
+
     for i, (img, label, slide_id) in enumerate(loader):
+        if early_stop_counter >= early_stop_thresh:
+            print('Reached early stopping criterion [stuck top encoding categorical choice]')
+            stopped_early = True
+            break
+
         model.zero_grad()
-
-        # img = img.to(device)
-
-        #out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img, label)
-        #out, latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
-        #latent_loss, enc_t, enc_b, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
-        #latent_loss, _, _, classifier_loss, recon_loss = model(img.cuda(), label.cuda())
-       
-        # try just returning losses and latent code IDs for a lighter memory output (to ease up gather size for GPU0) 
-        # latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img.cuda(), label.cuda())
 
         # now see if letting model figure out cuda assignment helps / if we don't need to call `.cuda()`
         latent_loss, classifier_loss, recon_loss, id_t, id_b = model(img, label) # dont think it matters with dataparallel!
@@ -128,16 +125,29 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
             mse_n += img.shape[0]
 
         lr = optimizer.param_groups[0]['lr']
+        unique_top = id_t.unique().shape[0]
+        unique_bot = id_b.unique().shape[0]
 
         loader.set_description(
             (
                 f'train; '
                 f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
                 f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
-                f'latent: {latent_loss.mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
-                f'lr: {lr:.5f}'
+                f'latent: {(latent_loss_weight * latent_loss).mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
+                f'lr: {lr:.5f}; '
+                f'top: {unique_top}; '
+                f'bot: {unique_bot} '
             )
         )
+
+        # print('Unique top, bot categories: {}, {}'.format(unique_top, unique_bot))
+        if unique_top < 2:
+            early_stop_counter += 1  # indicate lack of category assignment
+        else:
+            early_stop_counter = 0  # reset counter otherwise
+
+        log.loc[(epoch, i), 'unique_top'] = unique_top
+        log.loc[(epoch, i), 'unique_bot'] = unique_bot
 
         log.loc[(epoch, i), 'train_loss'] = loss.item()
         log.loc[(epoch, i), 'train_recon_loss'] = recon_loss.mean().item()
@@ -183,6 +193,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
 
             model.train()
 
+    return stopped_early 
 
 def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_weight=0.25, classifier_loss_weight=0.001):
     """
@@ -323,6 +334,9 @@ if __name__ == '__main__':
                         help='if specified, num. tiles to sample per slide')
     parser.add_argument('--balance_var', type=str, default='is_kirc',
                         help='paths_df column on which to groupby to evenly sample from')
+
+    parser.add_argument('-est','--early_stop_thresh', type=int, help='number of updates to wait until stopping if <2 categories used for top level encoding')
+
     args = parser.parse_args()
 
     print(args)
@@ -438,8 +452,9 @@ if __name__ == '__main__':
         labels=dev_paths_df[args.balance_var].values,
         transform_compose=dev_transform
     )
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers)
+    PIN_MEMORY = True
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers, pin_memory=PIN_MEMORY)
+    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.workers, pin_memory=PIN_MEMORY)
 
     print(len(train_dataset), len(dev_dataset))
     print('Using K={} codebook size'.format(args.n_embed))
@@ -466,12 +481,13 @@ if __name__ == '__main__':
     training_log = pd.DataFrame(columns=[
         'epoch','batch','train_mse_loss','dev_mse_loss']).set_index(['epoch', 'batch'])
 
-
+    stopped_early = False
     for i in range(args.epoch):
-        train(i, train_loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight)
-        evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir, args.classifier_loss_weight)
-        torch.save(
-            model.module.state_dict(), os.path.join(expt_dir, f'checkpoint/vqvae_{str(i + 1).zfill(3)}.pt')
-        )
-        training_log.to_csv(os.path.join(expt_dir, f'checkpoint/training_log_vqvae_{str(i + 1).zfill(3)}.csv'))
+        if not stopped_early:
+            stopped_early = train(i, train_loader, model, optimizer, scheduler, device, training_log, expt_dir, args.latent_loss_weight, args.classifier_loss_weight, args.early_stop_thresh)
+            if not stopped_early:
+                evaluate_dataset(i, dev_loader, model, device, training_log, expt_dir, args.classifier_loss_weight)
+
+            torch.save(model.module.state_dict(), os.path.join(expt_dir, f'checkpoint/vqvae_{str(i + 1).zfill(3)}.pt'))
+            training_log.to_csv(os.path.join(expt_dir, f'checkpoint/training_log_vqvae_{str(i + 1).zfill(3)}.csv'))
 
