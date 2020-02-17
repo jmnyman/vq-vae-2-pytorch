@@ -128,17 +128,17 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
         unique_top = id_t.unique().shape[0]
         unique_bot = id_b.unique().shape[0]
 
-        loader.set_description(
-            (
-                f'train; '
-                f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
-                f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
-                f'latent: {(latent_loss_weight * latent_loss).mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
-                f'lr: {lr:.5f}; '
-                f'top: {unique_top}; '
-                f'bot: {unique_bot} '
-            )
+        update_msg = (
+            f'train; '
+            f'epoch: {epoch + 1}; batch: {i}; mse: {recon_loss.mean().item():.5f}; '
+            f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
+            f'latent: {(latent_loss_weight * latent_loss).mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
+            f'lr: {lr:.5f}; '
+            f'top: {unique_top}; '
+            f'bot: {unique_bot} '
         )
+        loader.set_description(update_msg)
+        #print(update_msg)
 
         # print('Unique top, bot categories: {}, {}'.format(unique_top, unique_bot))
         if unique_top < 2:
@@ -158,6 +158,7 @@ def train(epoch, loader, model, optimizer, scheduler, device, log, expt_dir, lat
 
         if i % 100 == 0:
         #if i is None: # block for now while troubleshooting
+            print(update_msg)
             model.eval()
                 
             # my addition to try to just decode from category IDs instead
@@ -236,14 +237,14 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
             #enc_b_track.append(enc_b.detach().cpu())
             #label_track.append(label)
 
-            loader.set_description(
-                (
-                    f'eval; '
-                    f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
-                    f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
-                    f'latent: {latent_loss.mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
-                )
+            update_msg = (
+                f'eval; '
+                f'epoch: {epoch + 1}; mse: {recon_loss.mean().item():.5f}; '
+                f'classifier: {(classifier_loss_weight * classifier_loss).mean().item():.3f}; '
+                f'latent: {latent_loss.mean().item():.3f}; avg mse: {mse_sum / mse_n:.5f}; '
             )
+            loader.set_description(update_msg)
+            # print(update_msg)
 
             log.loc[(epoch,i),'eval_loss'] = loss.item()
             log.loc[(epoch,i),'eval_recon_loss'] = recon_loss.mean().item()
@@ -301,7 +302,7 @@ def evaluate_dataset(epoch, loader, model, device, log, expt_dir, latent_loss_we
         #plt.close()
 
     model.train()
-
+    print(update_msg)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
